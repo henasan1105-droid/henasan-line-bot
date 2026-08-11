@@ -1,0 +1,16 @@
+{
+  "name": "henasan-line-bot",
+  "version": "1.0.0",
+  "description": "河吶山 LINE Bot - 教練/美編訊息自動分類與轉發",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@line/bot-sdk": "^9.4.1 || ^10.0.0 || ^11.0.0",
+    "express": "^4.19.2"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
