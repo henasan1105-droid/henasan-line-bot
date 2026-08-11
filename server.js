@@ -3,17 +3,19 @@
  *
  * 運作方式：
  * 1. 教練或美編在 LINE 傳訊息給河吶山官方帳號
- * 2. Bot 依關鍵字判斷是「教練類」還是「美編類」訊息
+ * 2. Bot 用 AI（Claude）判斷這句話是「教練類」還是「美編類」，並整理出一句重點摘要
+ *    （如果 AI 呼叫失敗，會自動退回用關鍵字比對，確保 Bot 還是能正常運作）
  * 3. Bot 在原對話裡回覆一句確認收到的話
- * 4. Bot 同時把整理好的訊息（含分類標籤、寄件者、內容）推送給 Leo 的 LINE，
+ * 4. Bot 同時把整理好的訊息（含分類標籤、寄件者、重點摘要、原文）推送給 Leo 的 LINE，
  *    Leo 就不用一直在中間轉傳，但還是能看到所有往來訊息
  *
- * 這是 MVP 版本：分類用關鍵字比對，先求穩定可用。
- * 之後如果想要更聰明的分類（例如語意理解），可以把 classify() 換成呼叫 Claude API。
+ * 2026-08-12 更新：分類邏輯從純關鍵字比對，升級為呼叫 Claude API 做語意判斷，
+ * 準確度更高，也會順便幫忙抓出訊息重點。關鍵字比對保留作為備援方案。
  */
 
 const express = require("express");
 const line = require("@line/bot-sdk");
+const Anthropic = require("@anthropic-ai/sdk");
 
 const config = {
   channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
@@ -23,6 +25,11 @@ const config = {
 // Leo 自己的 LINE 使用者 ID，Bot 會把分類好的訊息推送到這裡
 // 取得方式見 README「如何取得你自己的 User ID」
 const LEO_USER_ID = process.env.LEO_USER_ID;
+
+// Claude API 金鑰，用來做語意分類。沒有設定的話會自動退回關鍵字比對。
+const anthropic = process.env.ANTHROPIC_API_KEY
+  ? new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
+  : null;
 
 const client = new line.messagingApi.MessagingApiClient({
   channelAccessToken: config.channelAccessToken,
@@ -37,7 +44,7 @@ app.use((req, res, next) => {
   next();
 });
 
-// ---- 分類規則（可自行增減關鍵字） ----
+// ---- 關鍵字備援規則（AI 分類失敗時才會用到，可自行增減關鍵字） ----
 const CATEGORY_RULES = [
   {
     name: "教練類",
@@ -57,13 +64,66 @@ const CATEGORY_RULES = [
   },
 ];
 
-function classify(text) {
+const EMOJI_MAP = {
+  教練類: "🥊",
+  美編類: "🎨",
+  其他: "💬",
+};
+
+// ---- 關鍵字比對（備援用） ----
+function classifyByKeyword(text) {
   for (const rule of CATEGORY_RULES) {
     if (rule.keywords.some((kw) => text.includes(kw))) {
-      return rule;
+      return { category: rule.name, summary: text.slice(0, 15) };
     }
   }
-  return { name: "其他", emoji: "💬" };
+  return { category: "其他", summary: text.slice(0, 15) };
+}
+
+// ---- AI 語意分類：判斷類別 + 整理一句重點摘要 ----
+async function classifyWithAI(text) {
+  if (!anthropic) return null;
+
+  const prompt = `你是河吶山運動工作室的訊息分類助手。請判斷以下訊息屬於：
+「教練類」（跟課程、學生、代課、請假、場地、器材、招生、上課安排有關）
+「美編類」（跟設計、文案、貼文、IG、輪播圖、素材、排版有關）
+或「其他」（以上都不是，例如閒聊、測試訊息）。
+
+同時用一句話（15字以內）整理這則訊息的重點，讓 Leo 一看就懂在講什麼。
+
+訊息內容：「${text}」
+
+只回傳這個格式的 JSON，不要加任何其他文字或說明：
+{"category": "教練類 或 美編類 或 其他", "summary": "重點摘要"}`;
+
+  try {
+    const response = await anthropic.messages.create({
+      model: "claude-haiku-4-5-20251001",
+      max_tokens: 200,
+      messages: [{ role: "user", content: prompt }],
+    });
+
+    const raw = response.content[0].text.trim();
+    // 避免 AI 偶爾多包一層 markdown code block，先去掉
+    const cleaned = raw.replace(/^```json\s*|\s*```$/g, "");
+    const parsed = JSON.parse(cleaned);
+
+    if (!["教練類", "美編類", "其他"].includes(parsed.category)) {
+      throw new Error(`AI 回傳了不在預期內的分類：${parsed.category}`);
+    }
+
+    return parsed;
+  } catch (e) {
+    console.error("[AI 分類失敗，改用關鍵字備援]", e.message || e);
+    return null;
+  }
+}
+
+async function classify(text) {
+  const aiResult = await classifyWithAI(text);
+  const result = aiResult || classifyByKeyword(text);
+  const emoji = EMOJI_MAP[result.category] || "💬";
+  return { name: result.category, emoji, summary: result.summary };
 }
 
 // ---- 取得訊息寄件者的顯示名稱 ----
@@ -92,7 +152,7 @@ async function handleEvent(event) {
   }
 
   const text = event.message.text;
-  const category = classify(text);
+  const category = await classify(text);
   const senderName = await getSenderName(event);
 
   // 1. 在原對話裡回覆確認收到
@@ -111,7 +171,8 @@ async function handleEvent(event) {
     const summary =
       `${category.emoji} ${category.name}\n` +
       `來自：${senderName}\n` +
-      `內容：${text}`;
+      `重點：${category.summary}\n` +
+      `原文：${text}`;
 
     await client.pushMessage({
       to: LEO_USER_ID,
@@ -122,11 +183,6 @@ async function handleEvent(event) {
   return null;
 }
 
-// 2026-08-11 更新：原本想沿用舊的 Railway webhook 網址（/webhook/line-agent），
-// 但發現那個服務其實是一整套 n8n（含 Postgres/Redis/worker），Railway 試用已到期、
-// 決定放棄那套改用這支輕量版程式，部署在全新的服務上。
-// 所以路徑改回標準的 /webhook，部署好新服務後記得回 LINE 官方帳號後台
-// 把 Webhook URL 改成新服務的網址（例如 https://xxx.onrender.com/webhook）。
 app.post(
   "/webhook",
   line.middleware(config),
