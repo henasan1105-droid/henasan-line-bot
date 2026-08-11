@@ -30,6 +30,13 @@ const client = new line.messagingApi.MessagingApiClient({
 
 const app = express();
 
+// 除錯用：把每個進來的請求方法跟路徑印出來，方便在 Render 的 Logs 頁面確認
+// LINE 平台的請求有沒有真的送到這支程式
+app.use((req, res, next) => {
+  console.log(`[incoming] ${req.method} ${req.path}`);
+  next();
+});
+
 // ---- 分類規則（可自行增減關鍵字） ----
 const CATEGORY_RULES = [
   {
@@ -115,10 +122,13 @@ async function handleEvent(event) {
   return null;
 }
 
-// 路徑跟 Leo 在 LINE 官方帳號後台已經填好的 Webhook 網址一致
-// （https://.../webhook/line-agent），這樣部署新版程式時就不用再去改 LINE 那邊的設定
+// 2026-08-11 更新：原本想沿用舊的 Railway webhook 網址（/webhook/line-agent），
+// 但發現那個服務其實是一整套 n8n（含 Postgres/Redis/worker），Railway 試用已到期、
+// 決定放棄那套改用這支輕量版程式，部署在全新的服務上。
+// 所以路徑改回標準的 /webhook，部署好新服務後記得回 LINE 官方帳號後台
+// 把 Webhook URL 改成新服務的網址（例如 https://xxx.onrender.com/webhook）。
 app.post(
-  "/webhook/line-agent",
+  "/webhook",
   line.middleware(config),
   async (req, res) => {
     try {
@@ -136,7 +146,11 @@ app.get("/", (req, res) => {
   res.send("河吶山 LINE Bot 運作中");
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+// 除錯用：如果請求沒有對到任何路由，印出來方便判斷是不是網址/路徑打錯
+app.use((req, res) => {
+  console.log(`[404] no route matched for ${req.method} ${req.path}`);
+  res.status(404).send("Not found");
 });
+
+const PORT = process.env.PORT || 3000;
+a
